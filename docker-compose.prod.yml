@@ -1,0 +1,328 @@
+# Production stack. Separate from docker-compose.yml (development) on purpose:
+# nothing here mounts source code, builds dev images or publishes a database port.
+#
+#   cp .env.production.example .env.production   # then fill it in
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+#
+# One port is published: the web server (WEB_PORT). Put a TLS-terminating load
+# balancer or reverse proxy in front of it. See docs/deployment.md.
+
+name: qa-agent-prod
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-backend: &backend
+  image: ${IMAGE_PREFIX:-qa-agent}-backend:${IMAGE_TAG:-latest}
+  build:
+    context: ./backend
+    target: prod
+  environment: &backend-env
+    APP_ENV: production
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    DATABASE_URL: postgresql+asyncpg://${APP_DB_USER:?set in .env.production}:${APP_DB_PASSWORD:?set in .env.production}@postgres:5432/${POSTGRES_DB:?set in .env.production}
+    REDIS_URL: redis://redis:6379/0
+    CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+    JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set in .env.production}
+    CREDENTIAL_MASTER_KEYS: ${CREDENTIAL_MASTER_KEYS:?set in .env.production}
+    AUTH_COOKIE_SECURE: "true"
+    PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set in .env.production}
+    FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
+    LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    LLM_REQUESTS_PER_MINUTE: ${LLM_REQUESTS_PER_MINUTE:-0}
+    LLM_MAX_ATTEMPTS: ${LLM_MAX_ATTEMPTS:-3}
+    LLM_RETRY_BASE_DELAY_S: ${LLM_RETRY_BASE_DELAY_S:-1}
+    LLM_RETRY_MAX_DELAY_S: ${LLM_RETRY_MAX_DELAY_S:-20}
+    OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+    LLM_MODEL_ANALYSIS: ${LLM_MODEL_ANALYSIS:-}
+    LLM_MODEL_GENERATION: ${LLM_MODEL_GENERATION:-}
+    LLM_INPUT_PRICE_PER_MTOK: ${LLM_INPUT_PRICE_PER_MTOK:-}
+    LLM_OUTPUT_PRICE_PER_MTOK: ${LLM_OUTPUT_PRICE_PER_MTOK:-}
+    LLM_MONTHLY_BUDGET_USD: ${LLM_MONTHLY_BUDGET_USD:-}
+    GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
+    METRICS_TOKEN: ${METRICS_TOKEN:-}
+    SMTP_HOST: ${SMTP_HOST:-}
+    SMTP_PORT: ${SMTP_PORT:-587}
+    SMTP_USERNAME: ${SMTP_USERNAME:-}
+    SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    SMTP_FROM: ${SMTP_FROM:-}
+    EVIDENCE_RETENTION_DAYS: ${EVIDENCE_RETENTION_DAYS:-30}
+    RUNNER_URL: http://runner:8900
+    ENGINE_URL: http://engine:8902
+  networks:
+    - backend
+  restart: unless-stopped
+  logging: *logging
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env.production}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env.production}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    logging: *logging
+
+  # Runs once per deployment, as the schema owner. The API and worker wait for it.
+  migrate:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    command: ["sh", "-c", "python -m app.db.bootstrap && alembic upgrade head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend
+    command:
+      - uvicorn
+      - app.main:create_app
+      - --factory
+      - --host=0.0.0.0
+      - --port=8000
+      - --workers=${API_WORKERS:-2}
+      - --proxy-headers
+      - --no-server-header
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - evidence:/var/lib/qa-agent/evidence:ro
+    networks:
+      - backend
+      - edge
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    mem_limit: ${API_MEMORY:-1g}
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "app.worker"]
+    stop_grace_period: 60s
+    environment:
+      <<: *backend-env
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set in .env.production}
+      EGRESS_ADMIN_URL: http://egress-proxy:8901
+      EGRESS_ADMIN_TOKEN: ${EGRESS_ADMIN_TOKEN:?set in .env.production}
+      EGRESS_PROXY_URL: http://egress-proxy:3128
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?set in .env.production}
+    volumes:
+      - evidence:/var/lib/qa-agent/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      runner:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_healthy
+      engine:
+        condition: service_healthy
+    networks:
+      - backend
+      - runner
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker", "--check"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: ${WORKER_MEMORY:-1g}
+
+  runner:
+    image: ${IMAGE_PREFIX:-qa-agent}-runner:${IMAGE_TAG:-latest}
+    build:
+      context: ./runner
+    environment:
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set in .env.production}
+      RUNNER_ADVERTISE_HOST: runner
+      RUNNER_MAX_SESSIONS: ${RUNNER_MAX_SESSIONS:-4}
+      RUNNER_SESSION_MAX_SECONDS: ${RUNNER_SESSION_MAX_SECONDS:-900}
+    networks:
+      - runner
+    shm_size: 1gb
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=1g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    mem_limit: ${RUNNER_MEMORY:-3g}
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8900/livez', timeout=2)"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging: *logging
+
+  engine:
+    image: ${IMAGE_PREFIX:-qa-agent}-engine:${IMAGE_TAG:-latest}
+    build:
+      context: ./backend
+      target: engine-prod
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?set in .env.production}
+      ENGINE_MAX_RUNS: ${ENGINE_MAX_RUNS:-2}
+    networks:
+      - runner
+    init: true
+    shm_size: 1gb
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=2g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 2048
+    mem_limit: ${ENGINE_MEMORY:-4g}
+    cpus: ${ENGINE_CPUS:-2}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8902/livez', timeout=2)"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *logging
+
+  egress-proxy:
+    <<: *backend
+    command:
+      ["uvicorn", "app.egress.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8901"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EGRESS_ADMIN_TOKEN: ${EGRESS_ADMIN_TOKEN:?set in .env.production}
+      EGRESS_DENY_CIDRS: ${RUNNER_SUBNET:-10.213.78.0/24}
+    networks:
+      - runner
+      - egress
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8901/livez', timeout=2)"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  web:
+    image: ${IMAGE_PREFIX:-qa-agent}-web:${IMAGE_TAG:-latest}
+    build:
+      context: ./frontend
+      target: prod
+      args:
+        VITE_APP_NAME: ${VITE_APP_NAME:-QA Agent}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:8080"
+    networks:
+      - edge
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging: *logging
+
+networks:
+  # The web server and the API.
+  edge:
+  # Data stores. The web server has no route to them.
+  backend:
+  # Worker, browsers and the egress proxy. Internal: no route outside.
+  runner:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${RUNNER_SUBNET:-10.213.78.0/24}
+  # The egress proxy's way out to the applications under test.
+  egress:
+
+volumes:
+  # Back these two up together: results in the database refer to files in `evidence`.
+  pgdata:
+  evidence:
+  redisdata:

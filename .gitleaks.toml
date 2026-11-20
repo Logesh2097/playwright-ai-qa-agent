@@ -1,0 +1,15 @@
+# Secret scanning. The default rules apply everywhere except the places below.
+title = "qa-agent"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Made-up values in tests and examples; local environment files are never committed"
+paths = [
+  '''backend/tests/.*''',
+  '''frontend/src/.*/__tests__/.*''',
+  '''e2e/.*''',
+  '''\.env$''',
+  '''docs/examples/.*''',
+]

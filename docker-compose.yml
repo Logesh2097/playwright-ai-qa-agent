@@ -1,0 +1,391 @@
+# Development stack. Configuration comes from .env (create it with `make env`).
+# Nothing here is a secret: required values fail loudly if .env is missing.
+
+name: qa-agent
+
+x-backend: &backend
+  # One image for the API, the worker and the migration job, so they cannot drift apart.
+  image: qa-agent-backend:dev
+  build:
+    context: ./backend
+    target: dev
+    args:
+      APP_UID: ${APP_UID:-1000}
+  environment: &backend-env
+    APP_ENV: ${APP_ENV:-development}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # The API and worker connect as a plain role that is subject to row-level security.
+    DATABASE_URL: postgresql+asyncpg://${APP_DB_USER:?set in .env}:${APP_DB_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:?set in .env}
+    REDIS_URL: redis://redis:6379/0
+    CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+    JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set in .env}
+    CREDENTIAL_MASTER_KEYS: ${CREDENTIAL_MASTER_KEYS:?set in .env}
+    # AI service. Optional: left empty, AI features answer 503 and everything else works.
+    LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    LLM_REQUESTS_PER_MINUTE: ${LLM_REQUESTS_PER_MINUTE:-0}
+    LLM_MAX_ATTEMPTS: ${LLM_MAX_ATTEMPTS:-3}
+    LLM_RETRY_BASE_DELAY_S: ${LLM_RETRY_BASE_DELAY_S:-1}
+    LLM_RETRY_MAX_DELAY_S: ${LLM_RETRY_MAX_DELAY_S:-20}
+    OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+    LLM_MODEL_ANALYSIS: ${LLM_MODEL_ANALYSIS:-}
+    LLM_MODEL_GENERATION: ${LLM_MODEL_GENERATION:-}
+    LLM_INPUT_PRICE_PER_MTOK: ${LLM_INPUT_PRICE_PER_MTOK:-}
+    LLM_OUTPUT_PRICE_PER_MTOK: ${LLM_OUTPUT_PRICE_PER_MTOK:-}
+    LLM_MONTHLY_BUDGET_USD: ${LLM_MONTHLY_BUDGET_USD:-}
+    AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
+    PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:5173}
+    # GitHub's REST API. Change only for GitHub Enterprise Server.
+    GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
+    # Bearer token for GET /metrics. Empty: the endpoint does not exist.
+    METRICS_TOKEN: ${METRICS_TOKEN:-}
+    SMTP_HOST: ${SMTP_HOST:-}
+    SMTP_PORT: ${SMTP_PORT:-587}
+    SMTP_USERNAME: ${SMTP_USERNAME:-}
+    SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    SMTP_FROM: ${SMTP_FROM:-}
+    # Trust X-Forwarded-For from the frontend proxy so rate limits see real client addresses.
+    FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
+    # Tells the API that browser automation exists. Only the worker can reach it.
+    RUNNER_URL: http://runner:8900
+    # Likewise for the test engine.
+    ENGINE_URL: http://engine:8902
+  volumes:
+    - ./backend:/app
+  networks:
+    - backend
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    <<: *backend
+    # Only this job holds the schema owner's credentials.
+    environment:
+      <<: *backend-env
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set in .env}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:?set in .env}
+    command: ["sh", "-c", "python -m app.db.bootstrap && alembic upgrade head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+      # The API only serves evidence; the worker writes it.
+      - evidence:/var/lib/qa-agent/evidence:ro
+    networks:
+      - backend
+      - edge
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "app.worker"]
+    # Time to let a running job reach a safe point. What still does not finish is
+    # closed by the recovery jobs of the next worker.
+    stop_grace_period: 60s
+    environment:
+      <<: *backend-env
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set in .env}
+      EGRESS_ADMIN_URL: http://egress-proxy:8901
+      EGRESS_ADMIN_TOKEN: ${EGRESS_ADMIN_TOKEN:?set in .env}
+      EGRESS_PROXY_URL: http://egress-proxy:3128
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?set in .env}
+    volumes:
+      - ./backend:/app
+      - evidence:/var/lib/qa-agent/evidence
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      runner:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_healthy
+      engine:
+        condition: service_healthy
+    networks:
+      - backend
+      - runner
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker", "--check"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Starts one Playwright MCP server (and browser) per session. It sits on an internal
+  # network: no route to the databases, and no route to the internet except through
+  # the egress proxy.
+  runner:
+    image: qa-agent-runner:dev
+    build:
+      context: ./runner
+    environment:
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set in .env}
+      RUNNER_ADVERTISE_HOST: runner
+      RUNNER_MAX_SESSIONS: ${RUNNER_MAX_SESSIONS:-4}
+      RUNNER_SESSION_MAX_SECONDS: ${RUNNER_SESSION_MAX_SECONDS:-900}
+    networks:
+      - runner
+    shm_size: 1gb
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=1g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    mem_limit: ${RUNNER_MEMORY:-3g}
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8900/livez', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # The deterministic test engine: runs approved test scripts with Playwright, one
+  # process per run. Same isolation as the runner: internal network, no database,
+  # no route out except through the egress proxy.
+  engine:
+    image: qa-agent-engine:dev
+    build:
+      context: ./backend
+      target: engine
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?set in .env}
+      ENGINE_MAX_RUNS: ${ENGINE_MAX_RUNS:-2}
+    volumes:
+      - ./backend:/app:ro
+    networks:
+      - runner
+    # An init process, so that browser processes orphaned when a run ends are reaped
+    # instead of piling up as zombies until the process limit is reached.
+    init: true
+    shm_size: 1gb
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=2g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 2048
+    mem_limit: ${ENGINE_MEMORY:-4g}
+    cpus: ${ENGINE_CPUS:-2}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8902/livez', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # The only way out of the runner network. Connects only to the origins a session's
+  # environment allows, after resolving and checking the address itself.
+  egress-proxy:
+    <<: *backend
+    command:
+      ["uvicorn", "app.egress.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8901"]
+    # Deliberately not the shared backend settings: no database, Redis or signing keys.
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EGRESS_ADMIN_TOKEN: ${EGRESS_ADMIN_TOKEN:?set in .env}
+      # Sessions may never reach the platform's own internal network.
+      EGRESS_DENY_CIDRS: ${RUNNER_SUBNET:-10.213.77.0/24}
+    networks:
+      - runner
+      - egress
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8901/livez', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # A small web application to point browser checks at. Not started by default:
+  #   docker compose --profile demo up -d demo-app
+  # then register http://demo-app:8080 as an environment with private addresses allowed.
+  demo-app:
+    profiles: ["demo", "test"]
+    image: python:3.12-slim
+    command: ["python", "/srv/server.py"]
+    volumes:
+      - ./fixtures/demo-app:/srv:ro
+    networks:
+      # egress: where the proxy reaches it. edge: so the API can resolve the name when
+      # the environment is saved.
+      - egress
+      - edge
+    restart: unless-stopped
+
+  # Runs the browser integration tests: it needs the database (like `migrate`) and the
+  # runner network (like `worker`).
+  browser-tests:
+    <<: *backend
+    profiles: ["test"]
+    environment:
+      <<: *backend-env
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set in .env}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:?set in .env}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set in .env}
+      EGRESS_ADMIN_URL: http://egress-proxy:8901
+      EGRESS_ADMIN_TOKEN: ${EGRESS_ADMIN_TOKEN:?set in .env}
+      EGRESS_PROXY_URL: http://egress-proxy:3128
+      ENGINE_TOKEN: ${ENGINE_TOKEN:?set in .env}
+      RUN_INTEGRATION: "1"
+      RUN_BROWSER: "1"
+    command: ["pytest", "-m", "browser"]
+    depends_on:
+      runner:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_healthy
+      engine:
+        condition: service_healthy
+      demo-app:
+        condition: service_started
+    networks:
+      - backend
+      - runner
+    restart: "no"
+
+  # Runs the engine's own tests: every action, locator and assertion in real browsers
+  # against the demo app, reached directly (the proxy is covered by browser-tests).
+  engine-tests:
+    profiles: ["test"]
+    image: qa-agent-engine:dev
+    environment:
+      RUN_ENGINE: "1"
+      DEMO_URL: http://demo-app:8080
+    command: ["pytest", "-m", "engine", "-p", "no:cacheprovider"]
+    volumes:
+      - ./backend:/app:ro
+    depends_on:
+      demo-app:
+        condition: service_started
+    networks:
+      - egress
+    shm_size: 1gb
+    restart: "no"
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    environment:
+      DEV_PROXY_TARGET: http://api:8000
+      VITE_API_BASE_URL: /api/v1
+      VITE_APP_NAME: ${VITE_APP_NAME:-QA Agent}
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-5173}:5173"
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:5173/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+networks:
+  # Browser-facing services.
+  edge:
+  # Data stores; the frontend container has no route to them.
+  backend:
+  # Worker, runner and egress proxy. Internal: containers on it have no route outside.
+  runner:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${RUNNER_SUBNET:-10.213.77.0/24}
+  # The egress proxy's way out to the applications under test.
+  egress:
+
+volumes:
+  # Screenshots, videos and traces of test runs.
+  evidence:
+  pgdata:
+  redisdata:
+  frontend_node_modules:

@@ -1,0 +1,89 @@
+[project]
+name = "qa-agent-backend"
+version = "0.1.0"
+description = "AI-powered QA agent platform: API and worker"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "redis>=5.2",
+    "arq>=0.26",
+    "argon2-cffi>=23.1",
+    "pyjwt>=2.9",
+    "email-validator>=2.2",
+    "cryptography>=43",
+    "httpx>=0.27",
+    "langchain-openai>=0.3",
+    # Gemini through Google's native API (LLM_PROVIDER=gemini).
+    "langchain-google-genai>=4.5,<5",
+    "langgraph>=0.4",
+    "mcp>=1.9",
+    # PDF export of test reports. Pure Python.
+    "fpdf2>=2.8",
+    # Must equal the version of the engine image (backend/Dockerfile, target "engine").
+    "playwright==1.65.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["."]
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "S", "ASYNC", "SIM", "T20", "RUF"]
+# Line length is the formatter's job; it leaves long string literals alone on purpose.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S608"]
+# Environment defaults must be set before the application is imported.
+"tests/conftest.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["app", "tests", "alembic"]
+
+[[tool.mypy.overrides]]
+# jsonschema ships no type information.
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+# Deprecations in our own use of the database layer fail the build instead of piling up.
+filterwarnings = ["error::sqlalchemy.exc.SADeprecationWarning"]
+markers = [
+    "integration: requires real PostgreSQL and Redis (set RUN_INTEGRATION=1)",
+    "engine: runs real browsers in the engine image (set RUN_ENGINE=1; `make engine-test`)",
+    "browser: requires the runner, the egress proxy and the demo app (set RUN_BROWSER=1; `make be-test-browser`)",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true

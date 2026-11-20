@@ -1,0 +1,71 @@
+# Example: run approved QA Agent tests for every pull request and fail the job
+# unless they verifiably pass.
+#
+# Copy to .github/workflows/qa-agent.yml in the repository under test.
+#
+# Settings to create in that repository (Settings → Secrets and variables → Actions):
+#   secret    QA_AGENT_API_KEY      an API key with the scopes executions:write and
+#                                   executions:read, limited to the project
+#   variable  QA_AGENT_URL          https://qa.example.com
+#   variable  QA_AGENT_PROJECT      project ID
+#   variable  QA_AGENT_ENVIRONMENT  environment ID the pull request is deployed to
+#   variable  QA_AGENT_SUITE        ID of an approved suite
+#
+# The tests run on the QA Agent installation against that environment, so the
+# change under test has to be deployed there first (the "deploy" job below is a
+# placeholder for however you do that).
+name: QA Agent tests
+
+on:
+  pull_request:
+    branches: [main]
+
+# The job only reads the repository. It has no write access to anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Secrets are not given to pull requests from forks; skip them there rather than fail.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      # - name: Deploy this change to the test environment
+      #   run: ./deploy-preview.sh
+
+      - name: Fetch the QA Agent CI script
+        # Pin the script to a commit of your QA Agent installation's repository.
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/YOUR-ORG/qa-agent/COMMIT-SHA/backend/ci/qa_agent_ci.py" \
+            --output qa_agent_ci.py
+
+      - name: Run approved tests
+        env:
+          QA_AGENT_URL: ${{ vars.QA_AGENT_URL }}
+          QA_AGENT_API_KEY: ${{ secrets.QA_AGENT_API_KEY }}
+          # The commit of the pull request itself, not of the temporary merge commit.
+          QA_AGENT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 qa_agent_ci.py \
+            --project "${{ vars.QA_AGENT_PROJECT }}" \
+            --environment "${{ vars.QA_AGENT_ENVIRONMENT }}" \
+            --suite "${{ vars.QA_AGENT_SUITE }}" \
+            --junit qa-agent-results.xml \
+            --json qa-agent-result.json \
+            --timeout 1800
+
+      - name: Keep the machine-readable results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-agent-results
+          path: |
+            qa-agent-results.xml
+            qa-agent-result.json
+          if-no-files-found: ignore
